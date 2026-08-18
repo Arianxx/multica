@@ -10,6 +10,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/pkg/protocol"
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // CancelTaskByUser (POST /api/tasks/{taskId}/cancel) used to key cancellation
@@ -617,6 +618,78 @@ func TestCancelTaskByUser_IssueTask_Succeeds(t *testing.T) {
 	}
 }
 
+func TestCancelTaskByUser_DelegatedFailureRecoveryAcknowledgesSignal(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	agentID := createHandlerTestAgent(t, "CancelRecoveryTaskAgent", []byte("[]"))
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
+		VALUES ($1, 'cancel-recovery-task', 'in_progress', 'medium', $2, 'member', 92004, 0)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var sourceTaskID, failedTaskID, recoveryCommentID, recoveryTaskID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, completed_at)
+		VALUES ($1, (SELECT runtime_id FROM agent WHERE id = $1), $2, 'completed', 0, now())
+		RETURNING id
+	`, agentID, issueID).Scan(&sourceTaskID); err != nil {
+		t.Fatalf("create source task: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority, completed_at,
+			delegated_from_task_id, trigger_evidence_kind
+		)
+		VALUES ($1, (SELECT runtime_id FROM agent WHERE id = $1), $2, 'failed', 0, now(), $3, 'comment')
+		RETURNING id
+	`, agentID, issueID, sourceTaskID).Scan(&failedTaskID); err != nil {
+		t.Fatalf("create failed task: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, source_task_id)
+		VALUES ($1, $2, 'system', $3, 'resume delegated coordination', 'progress_update', $4)
+		RETURNING id
+	`, issueID, testWorkspaceID, testUserID, failedTaskID).Scan(&recoveryCommentID); err != nil {
+		t.Fatalf("create recovery comment: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
+			trigger_evidence_kind, trigger_evidence_ref_id
+		)
+		VALUES ($1, (SELECT runtime_id FROM agent WHERE id = $1), $2, 'queued', 0, $3,
+		        'delegated_failure', $4)
+		RETURNING id
+	`, agentID, issueID, recoveryCommentID, failedTaskID).Scan(&recoveryTaskID); err != nil {
+		t.Fatalf("create recovery task: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	testHandler.CancelTaskByUser(w, cancelTaskByUserRequest(t, testUserID, recoveryTaskID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var status string
+	var acknowledged bool
+	if err := testPool.QueryRow(ctx, `
+		SELECT status, $2::uuid = ANY(delivered_comment_ids)
+		FROM agent_task_queue WHERE id = $1
+	`, recoveryTaskID, recoveryCommentID).Scan(&status, &acknowledged); err != nil {
+		t.Fatalf("read cancelled recovery task: %v", err)
+	}
+	if status != "cancelled" || !acknowledged {
+		t.Fatalf("cancelled recovery status/ack = %q/%v, want cancelled/true", status, acknowledged)
+	}
+}
+
 // TestCancelTaskByUser_ChatTask_NonCreator_Returns403 preserves chat privacy:
 // a workspace member who did not start the conversation cannot cancel its task.
 func TestCancelTaskByUser_ChatTask_NonCreator_Returns403(t *testing.T) {
@@ -1032,5 +1105,44 @@ func TestCancelTaskByUser_PrivateAgent_PlainMember_Returns403(t *testing.T) {
 	}
 	if got := taskStatus(t, taskID); got != "queued" {
 		t.Fatalf("task was mutated: status = %q", got)
+	}
+}
+
+func TestCancelTaskByUser_PersistsDriverTickFailureReason(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	agentID := createHandlerTestAgent(t, "CancelAttrDriverTickAgent", []byte("[]"))
+	issueID := insertAgentAssignedIssue(t, agentID, 94701, "cancel-attribution-driver-tick")
+	taskID := insertIssueTaskWithStatus(t, agentID, issueID, "dispatched")
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE agent_task_queue SET dispatched_at = now() WHERE id = $1`, taskID,
+	); err != nil {
+		t.Fatalf("stamp dispatched_at: %v", err)
+	}
+
+	reason := taskfailure.ReasonCancelTerminalFence.String()
+	req := newRequestAs(testUserID, "POST", "/api/tasks/"+taskID+"/cancel", map[string]string{
+		"failure_reason": reason,
+	})
+	req = withURLParam(req, "taskId", taskID)
+	w := httptest.NewRecorder()
+	testHandler.CancelTaskByUser(w, withChatTestWorkspaceCtx(t, req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var failureReason, triggerSummary string
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT failure_reason, trigger_summary FROM agent_task_queue WHERE id = $1
+	`, taskID).Scan(&failureReason, &triggerSummary); err != nil {
+		t.Fatalf("read attribution columns: %v", err)
+	}
+	if failureReason != reason {
+		t.Fatalf("failure_reason = %q, want %q", failureReason, reason)
+	}
+	if triggerSummary != taskfailure.CancelSummary(reason) {
+		t.Fatalf("trigger_summary = %q, want %q", triggerSummary, taskfailure.CancelSummary(reason))
 	}
 }

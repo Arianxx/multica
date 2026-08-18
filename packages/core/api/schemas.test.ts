@@ -841,6 +841,33 @@ describe("dashboard + runtime usage schema drift", () => {
   });
 });
 
+// A server that never heard of worktree mode also never sends this flag, and
+// it does not reject the mode either — it drops execution_mode and answers 201,
+// leaving the task to run in the user's working copy (#7113). So the absent
+// case has to parse as false, not as "unknown, probably fine".
+describe("AppConfigSchema local_worktree_supported drift", () => {
+  it("defaults to false when the server predates the signal", () => {
+    const parsed = AppConfigSchema.parse({ cdn_domain: "cdn.example.com" });
+    expect(parsed.local_worktree_supported).toBe(false);
+  });
+
+  it("coerces a malformed value to false rather than trusting it", () => {
+    const parsed = AppConfigSchema.parse({
+      cdn_domain: "cdn.example.com",
+      local_worktree_supported: "yes",
+    });
+    expect(parsed.local_worktree_supported).toBe(false);
+  });
+
+  it("carries a genuine true through", () => {
+    const parsed = AppConfigSchema.parse({
+      cdn_domain: "cdn.example.com",
+      local_worktree_supported: true,
+    });
+    expect(parsed.local_worktree_supported).toBe(true);
+  });
+});
+
 describe("AppConfigSchema cdn_signed drift", () => {
   it("defaults cdn_signed to false when the server omits it (pre-MUL-3254 servers)", () => {
     const parsed = AppConfigSchema.parse({ cdn_domain: "cdn.example.com" });
@@ -1505,6 +1532,19 @@ describe("issue status catalog schemas", () => {
     expect(parsed.is_system).toBe(false);
     expect(parsed.position).toBe(0);
     expect(parsed.archived_at).toBeNull();
+  });
+
+  // PATCH /api/issue-statuses/reorder returns the same catalog shape as the
+  // list endpoint, so a malformed reorder response degrades the same way rather
+  // than leaving the settings page holding an unparsed blob. (MUL-6243)
+  it("falls back on a malformed reorder response", () => {
+    const parsed = parseWithFallback(
+      { statuses: [{ id: 1 }], total: "many" },
+      ListIssueStatusesResponseSchema,
+      EMPTY_LIST_ISSUE_STATUSES_RESPONSE,
+      { endpoint: "PATCH /api/issue-statuses/reorder" },
+    );
+    expect(parsed).toEqual(EMPTY_LIST_ISSUE_STATUSES_RESPONSE);
   });
 
   it("keeps an unknown category as a string instead of failing the whole catalog", () => {

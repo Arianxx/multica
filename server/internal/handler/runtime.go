@@ -14,10 +14,12 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/pkg/agent"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 type AgentRuntimeResponse struct {
@@ -833,9 +835,12 @@ func unbindRuntimeForDelete(ctx context.Context, qtx *db.Queries, runtimeID pgty
 	}
 	out.PausedAutopilots = paused
 
+	fr, summary := service.CancelAttribution(taskfailure.ReasonCancelRuntimeTeardown.String())
 	cancelled, err := qtx.CancelAgentTasksByRuntimeOrAgent(ctx, db.CancelAgentTasksByRuntimeOrAgentParams{
-		RuntimeIds: []pgtype.UUID{runtimeID},
-		AgentIds:   unboundIDs,
+		RuntimeIds:    []pgtype.UUID{runtimeID},
+		AgentIds:      unboundIDs,
+		FailureReason: fr,
+		CancelSummary: summary,
 	})
 	if err != nil {
 		return out, fmt.Errorf("cancel tasks: %w", err)
