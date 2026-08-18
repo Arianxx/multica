@@ -10,6 +10,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/util"
 	"github.com/multica-ai/multica/server/pkg/protocol"
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // CancelTaskByUser (POST /api/tasks/{taskId}/cancel) used to key cancellation
@@ -1104,5 +1105,44 @@ func TestCancelTaskByUser_PrivateAgent_PlainMember_Returns403(t *testing.T) {
 	}
 	if got := taskStatus(t, taskID); got != "queued" {
 		t.Fatalf("task was mutated: status = %q", got)
+	}
+}
+
+func TestCancelTaskByUser_PersistsDriverTickFailureReason(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	agentID := createHandlerTestAgent(t, "CancelAttrDriverTickAgent", []byte("[]"))
+	issueID := insertAgentAssignedIssue(t, agentID, 94701, "cancel-attribution-driver-tick")
+	taskID := insertIssueTaskWithStatus(t, agentID, issueID, "dispatched")
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE agent_task_queue SET dispatched_at = now() WHERE id = $1`, taskID,
+	); err != nil {
+		t.Fatalf("stamp dispatched_at: %v", err)
+	}
+
+	reason := taskfailure.ReasonCancelTerminalFence.String()
+	req := newRequestAs(testUserID, "POST", "/api/tasks/"+taskID+"/cancel", map[string]string{
+		"failure_reason": reason,
+	})
+	req = withURLParam(req, "taskId", taskID)
+	w := httptest.NewRecorder()
+	testHandler.CancelTaskByUser(w, withChatTestWorkspaceCtx(t, req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var failureReason, triggerSummary string
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT failure_reason, trigger_summary FROM agent_task_queue WHERE id = $1
+	`, taskID).Scan(&failureReason, &triggerSummary); err != nil {
+		t.Fatalf("read attribution columns: %v", err)
+	}
+	if failureReason != reason {
+		t.Fatalf("failure_reason = %q, want %q", failureReason, reason)
+	}
+	if triggerSummary != taskfailure.CancelSummary(reason) {
+		t.Fatalf("trigger_summary = %q, want %q", triggerSummary, taskfailure.CancelSummary(reason))
 	}
 }

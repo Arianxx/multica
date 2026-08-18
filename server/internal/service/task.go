@@ -2409,8 +2409,8 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 	opts.ErrorMessage = util.SanitizeTextForPostgres(opts.ErrorMessage)
 	opts.FailureReason = util.SanitizeTextForPostgres(opts.FailureReason)
 
-	if opts.UserInitiated && (opts.ErrorMessage != "" || opts.FailureReason != "") {
-		return nil, errors.New("user-initiated cancellation cannot carry a server failure reason")
+	if opts.UserInitiated && opts.ErrorMessage != "" {
+		return nil, errors.New("user-initiated cancellation cannot carry a server error message")
 	}
 	var (
 		task                 db.AgentTaskQueue
@@ -2456,7 +2456,11 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 				err       error
 			)
 			if opts.UserInitiated {
-				cancelled, err = qtx.CancelAgentTaskByUser(ctx, taskID)
+				cancelled, err = qtx.CancelAgentTaskByUser(ctx, db.CancelAgentTaskByUserParams{
+					ID:            taskID,
+					FailureReason: fr,
+					CancelSummary: summary,
+				})
 			} else if opts.ErrorMessage != "" || opts.FailureReason != "" {
 				cancelled, err = qtx.CancelAgentTaskWithReason(ctx, db.CancelAgentTaskWithReasonParams{
 					ID:            taskID,

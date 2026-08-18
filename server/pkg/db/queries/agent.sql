@@ -1379,6 +1379,8 @@ UPDATE agent_task_queue AS task
 SET status = 'cancelled',
     completed_at = now(),
     prepare_lease_expires_at = NULL,
+    failure_reason = sqlc.arg('failure_reason'),
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary')),
     delivered_comment_ids = CASE
       -- Chat and ordinary issue tasks almost never carry a delegated-failure
       -- recovery signal. Keep their high-frequency user-cancel path to a
@@ -1426,7 +1428,7 @@ SET status = 'cancelled',
         )) AS receipt(id)
       )
     END
-WHERE task.id = $1
+WHERE task.id = sqlc.arg('id')
   AND task.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING task.*;
 

@@ -1848,6 +1848,7 @@ func (h *Handler) CancelTaskByUser(w http.ResponseWriter, r *http.Request) {
 		ExpectedChatSession:        expectedSession,
 		QueueAction:                queueAction,
 		UserInitiated:              true,
+		FailureReason:              failureReason,
 	})
 	if errors.Is(err, service.ErrTaskNoLongerQueued) {
 		writeError(w, http.StatusConflict, err.Error())
