@@ -20,6 +20,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // chatSessionTitleMaxLen caps the rename input. Long enough to fit a
@@ -589,7 +590,12 @@ func (h *Handler) SetChatSessionArchived(w http.ResponseWriter, r *http.Request)
 			// dispatched, running, waiting_local_directory and deferred, which
 			// is why the returned rows have to reach the post-commit broadcast
 			// below rather than being discarded.
-			cancelled, err = qtx.CancelAgentTasksByChatSession(r.Context(), session.ID)
+			fr, summary := service.CancelAttribution(taskfailure.ReasonCancelChatSession.String())
+			cancelled, err = qtx.CancelAgentTasksByChatSession(r.Context(), db.CancelAgentTasksByChatSessionParams{
+				ChatSessionID: session.ID,
+				FailureReason: fr,
+				CancelSummary: summary,
+			})
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to cancel queued tasks for the archived session")
 				return
@@ -694,7 +700,12 @@ func (h *Handler) DeleteChatSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cancelled, err := qtx.CancelAgentTasksByChatSession(r.Context(), session.ID)
+	fr, summary := service.CancelAttribution(taskfailure.ReasonCancelChatSession.String())
+	cancelled, err := qtx.CancelAgentTasksByChatSession(r.Context(), db.CancelAgentTasksByChatSessionParams{
+		ChatSessionID: session.ID,
+		FailureReason: fr,
+		CancelSummary: summary,
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to cancel chat session tasks")
 		return
@@ -1816,6 +1827,19 @@ func (h *Handler) CancelTaskByUser(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "you do not have access to this agent")
 			return
 		}
+	}
+
+	failureReason := r.URL.Query().Get("failure_reason")
+	if failureReason == "" && r.Body != nil {
+		var cancelBody struct {
+			FailureReason string `json:"failure_reason"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&cancelBody); err == nil && cancelBody.FailureReason != "" {
+			failureReason = cancelBody.FailureReason
+		}
+	}
+	if failureReason == "" {
+		failureReason = taskfailure.ReasonCancelUser.String()
 	}
 
 	cancelled, err := h.TaskService.CancelTaskWithResult(r.Context(), taskUUID, service.CancelTaskOptions{

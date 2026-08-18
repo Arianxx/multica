@@ -571,6 +571,7 @@ func init() {
 	// issue cancel-task
 	issueCancelTaskCmd.Flags().String("output", "json", "Output format: table or json")
 	issueCancelTaskCmd.Flags().String("issue", "", "Issue ID/key to scope short task ID prefix resolution")
+	issueCancelTaskCmd.Flags().String("failure-reason", "", "Canonical cancel.* failure_reason (WOR-447)")
 	// issue run-messages
 	issueRunMessagesCmd.Flags().String("output", "json", "Output format: table or json")
 	issueRunMessagesCmd.Flags().Int("since", 0, "Only return messages after this sequence number")
@@ -2341,8 +2342,12 @@ func runIssueCancelTask(cmd *cobra.Command, args []string) error {
 	}
 
 	var result map[string]any
+	body := map[string]any{}
+	if failureReason, _ := cmd.Flags().GetString("failure-reason"); failureReason != "" {
+		body["failure_reason"] = failureReason
+	}
 	path := "/api/tasks/" + url.PathEscape(taskRef.ID) + "/cancel"
-	if err := client.PostJSON(ctx, path, map[string]any{}, &result); err != nil {
+	if err := client.PostJSON(ctx, path, body, &result); err != nil {
 		return fmt.Errorf("cancel task: %w", err)
 	}
 

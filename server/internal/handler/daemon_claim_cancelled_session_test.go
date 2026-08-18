@@ -971,7 +971,12 @@ func deleteChatSessionLikeHandler(ctx context.Context, chatSessionID string) err
 		}
 		return err
 	}
-	if _, err := qtx.CancelAgentTasksByChatSession(ctx, id); err != nil {
+	fr, summary := service.CancelAttribution("cancel.chat_session")
+	if _, err := qtx.CancelAgentTasksByChatSession(ctx, db.CancelAgentTasksByChatSessionParams{
+		ChatSessionID: id,
+		FailureReason: fr,
+		CancelSummary: summary,
+	}); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

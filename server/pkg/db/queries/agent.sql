@@ -589,9 +589,13 @@ RETURNING *;
 -- (#1587). Prior :exec form silently dropped that info, leaving agents stuck at
 -- status="working" with no self-correction. Only issue-deletion cleanup calls
 -- this now; a status flip to cancelled/done no longer does (MUL-4465).
+-- failure_reason + trigger_summary backfill make server-side cancels observable
+-- in orchestration audits (WOR-447).
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
+    failure_reason = @failure_reason,
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary'))
+WHERE issue_id = @issue_id AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
 -- name: CancelAgentTasksByIssueAndAgent :many
@@ -600,8 +604,11 @@ RETURNING *;
 -- rerun flow so re-running the assignee doesn't collateral-cancel a
 -- still-running @-mention agent on the same issue.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE issue_id = $1 AND agent_id = $2 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
+    failure_reason = @failure_reason,
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary'))
+WHERE issue_id = @issue_id AND agent_id = @agent_id
+  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
 -- name: CancelAgentTasksByAgent :many
@@ -611,8 +618,10 @@ RETURNING *;
 -- (also :many + RETURNING + completed_at) so the three sibling cancel paths
 -- behave consistently.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE agent_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
+    failure_reason = @failure_reason,
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary'))
+WHERE agent_id = @agent_id AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
 -- name: CancelAgentTasksByTriggerComment :many
@@ -621,8 +630,10 @@ RETURNING *;
 -- coalesced input; cancellation prevents an agent from acting on a stale or
 -- deleted version. Must run before deletion clears trigger_comment_id.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE (trigger_comment_id = $1 OR $1 = ANY(coalesced_comment_ids))
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
+    failure_reason = @failure_reason,
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary'))
+WHERE (trigger_comment_id = @comment_id OR @comment_id = ANY(coalesced_comment_ids))
   AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
@@ -633,8 +644,11 @@ RETURNING *;
 -- the FK ON DELETE SET NULL would otherwise nullify chat_session_id and we
 -- could no longer reach those tasks.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE chat_session_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
+    failure_reason = @failure_reason,
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary'))
+WHERE chat_session_id = @chat_session_id
+  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
 -- name: GetAgentTask :one
@@ -1350,8 +1364,10 @@ RETURNING retry.*;
 -- Automatic cancellation without an explicit persisted failure reason. Unlike
 -- CancelAgentTaskByUser, this deliberately leaves recovery inputs replayable.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
+    failure_reason = @failure_reason,
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary'))
+WHERE id = @id AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
 -- name: CancelAgentTaskByUser :one
@@ -1458,6 +1474,7 @@ SET status = 'cancelled',
     completed_at = now(),
     error = sqlc.arg('error'),
     failure_reason = sqlc.arg('failure_reason'),
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary')),
     prepare_lease_expires_at = NULL
 WHERE id = sqlc.arg('id') AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
@@ -1466,7 +1483,9 @@ RETURNING *;
 -- Queue editing is a compare-and-set: never cancel a task that the daemon
 -- promoted between the user's click and this statement.
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
+    failure_reason = @failure_reason,
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary'))
 WHERE id = sqlc.arg('id')
   AND chat_session_id = sqlc.arg('chat_session_id')
   AND status = 'queued'
@@ -1480,7 +1499,7 @@ RETURNING *;
 WITH head AS MATERIALIZED (
   SELECT candidate.id
   FROM agent_task_queue AS candidate
-  WHERE candidate.chat_session_id = $1
+  WHERE candidate.chat_session_id = @chat_session_id
     AND candidate.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
     AND candidate.regenerate_quick_actions_for IS NULL
   ORDER BY
@@ -1495,8 +1514,10 @@ WITH head AS MATERIALIZED (
   LIMIT 1
 )
 UPDATE agent_task_queue AS queued
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE queued.chat_session_id = $1
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
+    failure_reason = @failure_reason,
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary'))
+WHERE queued.chat_session_id = @chat_session_id
   AND queued.status = 'queued'
   AND queued.id IS DISTINCT FROM (SELECT id FROM head)
 RETURNING queued.*;
@@ -1971,15 +1992,19 @@ RETURNING *;
 
 -- name: CancelDeferredEscalationsForTask :many
 UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE escalation_for_task_id = $1
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
+    failure_reason = @failure_reason,
+    trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary'))
+WHERE escalation_for_task_id = @escalation_for_task_id
   AND status IN ('deferred', 'queued', 'dispatched', 'waiting_local_directory')
 RETURNING *;
 
 -- name: CancelDeferredEscalationsForIssueAgent :many
 WITH cancelled AS (
     UPDATE agent_task_queue fallback
-    SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
+    SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL,
+        failure_reason = @failure_reason,
+        trigger_summary = COALESCE(trigger_summary, sqlc.narg('cancel_summary'))
     FROM agent_task_queue primary_task
     WHERE fallback.escalation_for_task_id = primary_task.id
       AND fallback.status IN ('deferred', 'queued', 'dispatched', 'waiting_local_directory')

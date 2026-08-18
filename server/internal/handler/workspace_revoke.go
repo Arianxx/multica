@@ -5,8 +5,10 @@ import (
 	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // revokeAndRemoveMember converges all server-side state that should follow a
@@ -101,9 +103,12 @@ func (h *Handler) revokeAndRemoveMember(ctx context.Context, workspaceID, userID
 		for i, a := range result.ArchivedAgents {
 			archivedAgentIDs[i] = a.ID
 		}
+		fr, summary := service.CancelAttribution(taskfailure.ReasonCancelRuntimeTeardown.String())
 		result.CancelledTasks, err = qtx.CancelAgentTasksByRuntimeOrAgent(ctx, db.CancelAgentTasksByRuntimeOrAgentParams{
-			RuntimeIds: runtimeIDs,
-			AgentIds:   archivedAgentIDs,
+			RuntimeIds:    runtimeIDs,
+			AgentIds:      archivedAgentIDs,
+			FailureReason: fr,
+			CancelSummary: summary,
 		})
 		if err != nil {
 			return empty, err

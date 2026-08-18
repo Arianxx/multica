@@ -2162,7 +2162,12 @@ func (s *TaskService) OpenMikaOnboardingChat(ctx context.Context, session db.Cha
 // `multica agent update <id> --status idle` to unwedge. It now reconciles agent
 // status and broadcasts task:cancelled, matching CancelTask and RerunIssue.
 func (s *TaskService) CancelTasksForIssue(ctx context.Context, issueID pgtype.UUID) error {
-	cancelled, err := s.Queries.CancelAgentTasksByIssue(ctx, issueID)
+	fr, summary := CancelAttribution(taskfailure.ReasonCancelIssueDeleted.String())
+	cancelled, err := s.Queries.CancelAgentTasksByIssue(ctx, db.CancelAgentTasksByIssueParams{
+		IssueID:       issueID,
+		FailureReason: fr,
+		CancelSummary: summary,
+	})
 	if err != nil {
 		return err
 	}
@@ -2199,6 +2204,22 @@ func distinctAgentIDs(cancelled []db.AgentTaskQueue) []pgtype.UUID {
 	return ids
 }
 
+// CancelAttribution maps a canonical cancel.* reason to DB columns used by audits.
+func CancelAttribution(reason string) (pgtype.Text, pgtype.Text) {
+	if reason == "" {
+		reason = taskfailure.ReasonCancelPlatform.String()
+	}
+	return pgtype.Text{String: reason, Valid: true},
+		pgtype.Text{String: taskfailure.CancelSummary(reason), Valid: true}
+}
+
+func resolveCancelReason(given, defaultReason string) string {
+	if given != "" {
+		return given
+	}
+	return defaultReason
+}
+
 // CancelTasksForAgent cancels every active task belonging to an agent
 // (queued + dispatched + running), reconciles the agent's status, and
 // broadcasts task:cancelled events. Used by the agent-level "Cancel all
@@ -2206,7 +2227,12 @@ func distinctAgentIDs(cancelled []db.AgentTaskQueue) []pgtype.UUID {
 //
 // Returns the cancelled rows so callers can report counts / log them.
 func (s *TaskService) CancelTasksForAgent(ctx context.Context, agentID pgtype.UUID) ([]db.AgentTaskQueue, error) {
-	cancelled, err := s.Queries.CancelAgentTasksByAgent(ctx, agentID)
+	fr, summary := CancelAttribution(taskfailure.ReasonCancelAgentBulk.String())
+	cancelled, err := s.Queries.CancelAgentTasksByAgent(ctx, db.CancelAgentTasksByAgentParams{
+		AgentID:       agentID,
+		FailureReason: fr,
+		CancelSummary: summary,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2227,7 +2253,12 @@ func (s *TaskService) CancelTasksForAgent(ctx context.Context, agentID pgtype.UU
 // retained for call-site stability. It must run before deletion clears the
 // trigger FK; the returned rows let the handler re-route every surviving input.
 func (s *TaskService) CancelTasksByTriggerComment(ctx context.Context, commentID pgtype.UUID) ([]db.AgentTaskQueue, error) {
-	cancelled, err := s.Queries.CancelAgentTasksByTriggerComment(ctx, commentID)
+	fr, summary := CancelAttribution(taskfailure.ReasonCancelTriggerStale.String())
+	cancelled, err := s.Queries.CancelAgentTasksByTriggerComment(ctx, db.CancelAgentTasksByTriggerCommentParams{
+		CommentID:     commentID,
+		FailureReason: fr,
+		CancelSummary: summary,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2332,16 +2363,7 @@ type CancelTaskOptions struct {
 // an explicit issue-task cancellation. It broadcasts a task:cancelled event so
 // frontends can update immediately.
 func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.AgentTaskQueue, error) {
-	// Callers of this wrapper are automatic non-chat repair/daemon paths, so
-	// finalizeCancelledChatMessage returns before the gate is even read.
-	// Should a chat task ever reach here, there is no client waiting on a
-	// synchronous restore anyway, and the durable path is the only one that can
-	// hand the prompt back at all.
-	result, err := s.CancelTaskWithResult(ctx, taskID, CancelTaskOptions{ClientSupportsDraftRestore: true})
-	if err != nil {
-		return nil, err
-	}
-	return &result.Task, nil
+	return s.CancelTaskWithReason(ctx, taskID, "", taskfailure.ReasonCancelPlatform.String())
 }
 
 // CancelTaskByUser is the explicit issue-task cancellation path. Unlike an
@@ -2395,6 +2417,8 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 		cancelledChatMessage *CancelledChatMessageResult
 		err                  error
 	)
+	reason := resolveCancelReason(opts.FailureReason, taskfailure.ReasonCancelUser.String())
+	fr, summary := CancelAttribution(reason)
 	if opts.QueuedOnly {
 		if opts.QueueAction != "edit" && opts.QueueAction != "remove" {
 			return nil, errors.New("queue action must be edit or remove")
@@ -2406,6 +2430,8 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 			task, err = qtx.CancelQueuedAgentTask(ctx, db.CancelQueuedAgentTaskParams{
 				ID:            taskID,
 				ChatSessionID: opts.ExpectedChatSession,
+				FailureReason: fr,
+				CancelSummary: summary,
 			})
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrTaskNoLongerQueued
@@ -2435,10 +2461,15 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 				cancelled, err = qtx.CancelAgentTaskWithReason(ctx, db.CancelAgentTaskWithReasonParams{
 					ID:            taskID,
 					Error:         pgtype.Text{String: opts.ErrorMessage, Valid: opts.ErrorMessage != ""},
-					FailureReason: pgtype.Text{String: opts.FailureReason, Valid: opts.FailureReason != ""},
+					FailureReason: fr,
+					CancelSummary: summary,
 				})
 			} else {
-				cancelled, err = qtx.CancelAgentTask(ctx, taskID)
+				cancelled, err = qtx.CancelAgentTask(ctx, db.CancelAgentTaskParams{
+					ID:            taskID,
+					FailureReason: fr,
+					CancelSummary: summary,
+				})
 			}
 			if err != nil {
 				return err
@@ -2499,7 +2530,12 @@ func (s *TaskService) CancelQueuedChatTasks(ctx context.Context, sessionID, agen
 			return fmt.Errorf("lock chat agent: %w", err)
 		}
 		var err error
-		tasks, err = qtx.CancelQueuedAgentTasksForSession(ctx, sessionID)
+		fr, summary := CancelAttribution(taskfailure.ReasonCancelUser.String())
+		tasks, err = qtx.CancelQueuedAgentTasksForSession(ctx, db.CancelQueuedAgentTasksForSessionParams{
+			ChatSessionID: sessionID,
+			FailureReason: fr,
+			CancelSummary: summary,
+		})
 		if err != nil {
 			return fmt.Errorf("cancel queued chat tasks: %w", err)
 		}
@@ -3531,7 +3567,12 @@ func (s *TaskService) StartTask(ctx context.Context, taskID pgtype.UUID) (*db.Ag
 }
 
 func (s *TaskService) cancelDeferredEscalationsForTask(ctx context.Context, taskID pgtype.UUID) {
-	cancelled, err := s.Queries.CancelDeferredEscalationsForTask(ctx, taskID)
+	fr, summary := CancelAttribution(taskfailure.ReasonCancelPlatform.String())
+	cancelled, err := s.Queries.CancelDeferredEscalationsForTask(ctx, db.CancelDeferredEscalationsForTaskParams{
+		EscalationForTaskID: taskID,
+		FailureReason:       fr,
+		CancelSummary:         summary,
+	})
 	if err != nil {
 		slog.Warn("cancel deferred escalations for task failed", "task_id", util.UUIDToString(taskID), "error", err)
 		return
@@ -3546,9 +3587,12 @@ func (s *TaskService) cancelDeferredEscalationsForTask(ctx context.Context, task
 }
 
 func (s *TaskService) CancelDeferredEscalationsForIssueAgent(ctx context.Context, issueID, agentID pgtype.UUID) {
+	fr, summary := CancelAttribution(taskfailure.ReasonCancelPlatform.String())
 	cancelled, err := s.Queries.CancelDeferredEscalationsForIssueAgent(ctx, db.CancelDeferredEscalationsForIssueAgentParams{
-		IssueID: issueID,
-		AgentID: agentID,
+		IssueID:       issueID,
+		AgentID:       agentID,
+		FailureReason: fr,
+		CancelSummary: summary,
 	})
 	if err != nil {
 		slog.Warn("cancel deferred escalations for issue agent failed",
@@ -4717,9 +4761,12 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 	// signals, so this intentionally stays on the server-cancel query. Any
 	// undelivered delegated-failure signal remains an outbox obligation and the
 	// sweeper can merge it into the fresh rerun task.
+	fr, summary := CancelAttribution(taskfailure.ReasonCancelSupersededRerun.String())
 	cancelled, err := s.Queries.CancelAgentTasksByIssueAndAgent(ctx, db.CancelAgentTasksByIssueAndAgentParams{
-		IssueID: issueID,
-		AgentID: agentID,
+		IssueID:       issueID,
+		AgentID:       agentID,
+		FailureReason: fr,
+		CancelSummary: summary,
 	})
 	if err != nil {
 		slog.Warn("rerun: cancel prior tasks failed",
