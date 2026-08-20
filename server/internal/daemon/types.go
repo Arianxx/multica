@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
-	"github.com/multica-ai/multica/server/pkg/pluginruntime"
+	"github.com/multica-ai/multica/server/pkg/remotemcp"
 )
 
 // AgentEntry describes a single available agent CLI.
@@ -33,6 +33,9 @@ type Runtime struct {
 	// command_name to the executable to launch. Built-in (provider-detected)
 	// runtimes leave this empty.
 	ProfileID string `json:"profile_id,omitempty"`
+	// Metadata is the server-side runtime metadata blob (agent_runtime.metadata).
+	// User-editable keys such as transport_retry are merged into daemon config.
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
 // RepoData holds repository information from the workspace.
@@ -71,13 +74,12 @@ type ActiveSiblingRunData struct {
 // Task represents a claimed task from the server.
 // Agent data (name, skills) is populated by the claim endpoint.
 type Task struct {
-	ID                      string                              `json:"id"`
-	AgentID                 string                              `json:"agent_id"`
-	RuntimeID               string                              `json:"runtime_id"`
-	IssueID                 string                              `json:"issue_id"`
-	WorkspaceID             string                              `json:"workspace_id"`
-	PluginExecutionManifest *PluginExecutionManifestData        `json:"plugin_execution_manifest,omitempty"`
-	RemoteMCPConnections    []pluginruntime.RemoteMCPConnection `json:"remote_mcp_connections,omitempty"`
+	ID                   string                 `json:"id"`
+	AgentID              string                 `json:"agent_id"`
+	RuntimeID            string                 `json:"runtime_id"`
+	IssueID              string                 `json:"issue_id"`
+	WorkspaceID          string                 `json:"workspace_id"`
+	RemoteMCPConnections []remotemcp.Connection `json:"remote_mcp_connections,omitempty"`
 	// RemoteMCPDaemonToken stays inside the daemon and authenticates the local
 	// broker's credential-resolution calls. It must never enter agent env/config.
 	RemoteMCPDaemonToken string `json:"remote_mcp_daemon_token,omitempty"`
@@ -163,21 +165,6 @@ type Task struct {
 	// Empty or non-task-scoped values are fatal for writable agent tasks; the
 	// daemon must not fall back to its own token. See MUL-3292.
 	AuthToken string `json:"auth_token,omitempty"`
-}
-
-// PluginExecutionManifestData mirrors the immutable enqueue-time plugin pin
-// returned by the server. The daemon materializes its skill refs through the
-// normal content-addressed cache; this record is retained on the task for run
-// attribution and diagnostics.
-type PluginExecutionManifestData struct {
-	ID                   string          `json:"id"`
-	SnapshotID           string          `json:"snapshot_id,omitempty"`
-	SnapshotRevision     int64           `json:"snapshot_revision"`
-	SnapshotDigest       string          `json:"snapshot_digest,omitempty"`
-	ComposerVersion      string          `json:"composer_version"`
-	SchemaVersion        int32           `json:"schema_version"`
-	OrderedContributions json.RawMessage `json:"ordered_contributions"`
-	Diagnostics          []string        `json:"diagnostics,omitempty"`
 }
 
 // ChatAttachmentMeta is the structured attachment metadata the daemon
@@ -309,4 +296,6 @@ type TaskResult struct {
 	// precisely when the abandoned id would otherwise stay selectable.
 	RetiredSessionID string           `json:"-"`
 	Usage            []TaskUsageEntry `json:"usage,omitempty"` // per-model token usage
+	// TransportRetryReceipt is optional daemon-local JSON persisted in .gc_meta.json.
+	TransportRetryReceipt json.RawMessage `json:"-"`
 }

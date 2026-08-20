@@ -100,6 +100,8 @@ func TestClassifyRules(t *testing.T) {
 		{"stream disconnected", "stream disconnected before completion", ReasonAgentProviderNetwork},
 		{"connection closed mid-response", "API Error: Connection closed mid-response. The response above may be incomplete.", ReasonAgentProviderNetwork},
 		{"connection closed with exit status wins over process failure", "claude exited with error: exit status 1\nAPI Error: Connection closed mid-response.", ReasonAgentProviderNetwork},
+		{"cursor writableiterable with exit status wins over process failure", "cursor-agent exited with error: exit status 1 (result_seen=false, exit_code=1, scanner_error=false, event_count=319, invalid_event_count=0, last_event_type=thinking); actions completed before finalization may already have taken effect; cursor stderr: RetriableError: WritableIterable is closed\nError: command failed unexpectedly.", ReasonAgentProviderNetwork},
+		{"cursor writableiterable stderr alone", "RetriableError: WritableIterable is closed\nError: command failed unexpectedly.", ReasonAgentProviderNetwork},
 		{"error sending request", "error sending request for url (https://api.example.com/v1)", ReasonAgentProviderNetwork},
 		{"unable to connect", "unable to connect to provider", ReasonAgentProviderNetwork},
 		{"dial tcp", "dial tcp 1.2.3.4:443: connect: connection refused", ReasonAgentProviderNetwork},
@@ -419,6 +421,27 @@ func TestNormalizeDaemonReason(t *testing.T) {
 			raw:    "API Error: the model is overloaded",
 			want:   ReasonAgentUnknown,
 		},
+
+		// --- cursor-agent WritableIterable: an un-upgraded daemon classifies
+		// the trailing exit status as process_failure, which is not retryable.
+		{
+			name:   "old daemon process_failure on writableiterable is upgraded",
+			reason: string(ReasonAgentProcessFailure),
+			raw:    "cursor-agent exited with error: exit status 1 (result_seen=false, exit_code=1, scanner_error=false, event_count=319, invalid_event_count=0, last_event_type=thinking); cursor stderr: RetriableError: WritableIterable is closed\nError: command failed unexpectedly.",
+			want:   ReasonAgentProviderNetwork,
+		},
+		{
+			name:   "old daemon catchall on writableiterable is upgraded",
+			reason: string(ReasonAgentUnknown),
+			raw:    "RetriableError: WritableIterable is closed\nError: command failed unexpectedly.",
+			want:   ReasonAgentProviderNetwork,
+		},
+		{
+			name:   "current daemon provider_network reason passes through",
+			reason: string(ReasonAgentProviderNetwork),
+			raw:    "cursor-agent exited with error: exit status 1; cursor stderr: RetriableError: WritableIterable is closed",
+			want:   ReasonAgentProviderNetwork,
+		},
 	}
 
 	for _, tc := range cases {
@@ -496,5 +519,74 @@ func TestProviderUnconfiguredAgreesWithClassify(t *testing.T) {
 	}
 	if got := Classify(errText); got != ReasonAgentMissingConfig {
 		t.Errorf("Classify(%q) = %q, want %q", errText, got, ReasonAgentMissingConfig)
+	}
+}
+
+// TestNormalizeDaemonReasonUpgradesOpenclawCLITimeout covers the mixed-version
+// window for #7112. A daemon that predates the timeout sentinel classifies the
+// failure from its text and lands on agent_error.provider_network, which is
+// worse than merely imprecise: that reason is on the auto-retry allowlist, so
+// every attempt re-pays the same 8-11s stall and fails identically, and the
+// chat bubble tells the user to check a network that was never involved.
+// Recognising the wire shape fixes both the moment the server deploys.
+func TestNormalizeDaemonReasonUpgradesOpenclawCLITimeout(t *testing.T) {
+	t.Parallel()
+
+	const rawError = "prepare execution environment: execenv: prepare openclaw config: " +
+		"locate openclaw active config: openclaw config file: context deadline exceeded " +
+		"(process: signal: killed)"
+
+	for _, legacy := range []string{
+		string(ReasonAgentProviderNetwork),
+		string(ReasonAgentUnknown),
+		"agent_error",
+	} {
+		if got := NormalizeDaemonReason(legacy, rawError); got != ReasonRuntimeCLITimeout {
+			t.Errorf("NormalizeDaemonReason(%q, openclaw timeout) = %q, want %q", legacy, got, ReasonRuntimeCLITimeout)
+		}
+	}
+
+	// A current daemon already reports the precise reason; normalization must
+	// leave it alone.
+	if got := NormalizeDaemonReason(string(ReasonRuntimeCLITimeout), rawError); got != ReasonRuntimeCLITimeout {
+		t.Errorf("NormalizeDaemonReason(runtime_cli_timeout) = %q, want it preserved", got)
+	}
+
+	// Both witnesses are required. A real provider-side deadline, and an
+	// openclaw prep failure that is not a timeout, must keep their own
+	// classification — the global "deadline exceeded" rule still belongs to
+	// genuine network stalls.
+	unrelated := map[string]struct {
+		reason   string
+		rawError string
+		want     Reason
+	}{
+		"provider deadline stays provider_network": {
+			reason:   string(ReasonAgentProviderNetwork),
+			rawError: "API Error: context deadline exceeded while streaming from provider",
+			want:     ReasonAgentProviderNetwork,
+		},
+		"openclaw prep failure without a timeout is untouched": {
+			reason:   string(ReasonAgentUnknown),
+			rawError: "execenv: prepare openclaw config: read openclaw agents.list: exit status 1",
+			want:     ReasonAgentUnknown,
+		},
+	}
+	for name, tc := range unrelated {
+		if got := NormalizeDaemonReason(tc.reason, tc.rawError); got != tc.want {
+			t.Errorf("%s: NormalizeDaemonReason = %q, want %q", name, got, tc.want)
+		}
+	}
+}
+
+// TestClassifyKeepsDeadlineExceededAsProviderNetwork pins the rule the fix
+// deliberately did NOT touch. Local runtime CLI timeouts are recognised
+// structurally, upstream of Classify; the text rule still has to serve real
+// provider stalls, which are transient and retryable.
+func TestClassifyKeepsDeadlineExceededAsProviderNetwork(t *testing.T) {
+	t.Parallel()
+
+	if got := Classify("post to provider: context deadline exceeded"); got != ReasonAgentProviderNetwork {
+		t.Errorf("Classify(provider deadline) = %q, want %q", got, ReasonAgentProviderNetwork)
 	}
 }

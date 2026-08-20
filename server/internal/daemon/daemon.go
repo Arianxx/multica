@@ -26,6 +26,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/cli"
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/multica-ai/multica/server/internal/daemon/repocache"
+	"github.com/multica-ai/multica/server/internal/daemon/transportretry"
 	"github.com/multica-ai/multica/server/internal/selfexec"
 	"github.com/multica-ai/multica/server/pkg/agent"
 	"github.com/multica-ai/multica/server/pkg/redact"
@@ -2987,6 +2988,26 @@ func (d *Daemon) workspaceCoAuthoredByEnabled(workspaceID string) bool {
 	return *s.CoAuthoredByEnabled
 }
 
+func (d *Daemon) workspaceSettings(workspaceID string) json.RawMessage {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ws, ok := d.workspaces[workspaceID]
+	if !ok {
+		return nil
+	}
+	return ws.settings
+}
+
+func (d *Daemon) runtimeMetadata(runtimeID string) json.RawMessage {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rt, ok := d.runtimeIndex[runtimeID]
+	if !ok {
+		return nil
+	}
+	return rt.Metadata
+}
+
 // registerTaskRepos merges task-scoped repos (e.g. project github_repo
 // resources lifted into resp.Repos by the claim handler) into the workspace's
 // allowlist and kicks off a cache sync for any URLs that aren't yet cached.
@@ -5187,6 +5208,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 			if assignment, _ := localDirectoryAssignmentForTask(task, d.cfg.DaemonID); assignment != nil && !assignment.UsesWorktree() {
 				meta.LocalDirectory = true
 			}
+			if len(result.TransportRetryReceipt) > 0 {
+				meta.TransportRetry = result.TransportRetryReceipt
+			}
 			if err := execenv.WriteGCMeta(result.EnvRoot, meta, taskLog); err != nil {
 				taskLog.Warn("write gc meta failed (non-fatal)", "error", err)
 			}
@@ -5215,6 +5239,15 @@ func taskRunFailureReason(err error) string {
 	// room (MUL-5370).
 	if errors.Is(err, errSkillBundleUnavailable) {
 		return taskfailure.ReasonSkillBundleUnavailable.String()
+	}
+	// Structural, not textual: the message ends in "context deadline exceeded",
+	// which Classify routes to agent_error.provider_network — "the connection to
+	// the model provider dropped, check your network" for a stall that is purely
+	// local, plus an auto-retry of a failure that is deterministic on the host.
+	// The sentinel survives the preparation helper boundary via
+	// preparationErrorKind (#7112).
+	if errors.Is(err, execenv.ErrOpenclawCLITimeout) {
+		return taskfailure.ReasonRuntimeCLITimeout.String()
 	}
 	return taskfailure.Classify(err.Error()).String()
 }
@@ -5570,6 +5603,7 @@ var runtimeDisplayNameOverrides = map[string]string{
 	"qoderclicn": "Qoder CN",
 	"qwen":       "Qwen Code",
 	"qwenpaw":    "QwenPaw",
+	"mcode":      "MiniMax Code",
 }
 
 func init() {
@@ -5607,7 +5641,8 @@ func providerDisplayName(name string) string {
 // probed each one over its real launch path with a canary in the context file
 // and no inline delivery: claude 2.1.220 (CLAUDE.md), codex 0.144.6 driving the
 // app-server (AGENTS.md), opencode 1.17.7 (AGENTS.md), pi 0.67.2 (AGENTS.md),
-// hermes 0.18.2 over ACP (AGENTS.md). kiro was confirmed earlier by a kiro-cli
+// hermes 0.18.2 over ACP (AGENTS.md). MCode 0.1.2 also loads AGENTS.md by its
+// native runtime contract. kiro was confirmed earlier by a kiro-cli
 // 2.13.0 ACP smoke — see the call site. Still unprobed: grok, qoder, codebuddy.
 func providerNeedsInlineSystemPrompt(provider string) bool {
 	switch provider {
@@ -7067,13 +7102,47 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		"idle_watchdog", execOpts.IdleWatchdogTimeout,
 	)
 
-	// Shared across the resume-retry below so the retry's transcript rows
-	// keep ascending seq values for the same task.
+	// Shared across transport-retry and the resume-retry below so every launch's
+	// transcript rows keep ascending seq values for the same task.
 	var msgSeq atomic.Int32
-	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
+	onTransportFreshSession := func(opts *agent.ExecOptions) string {
+		task.PriorSessionID = ""
+		task.PriorSessionResumeUnavailable = true
+		opts.ResumeContinuityNotice = ""
+		taskCtx.PriorSessionResumed = false
+		if freshBrief, briefErr := execenv.InjectRuntimeConfig(env.WorkDir, provider, taskCtx); briefErr != nil {
+			taskLog.Warn("execenv: re-inject cold runtime config for transport fresh retry failed (non-fatal)", "error", briefErr)
+		} else {
+			runtimeBrief = freshBrief
+			if providerNeedsInlineSystemPrompt(provider) {
+				opts.SystemPrompt = runtimeBrief
+			}
+		}
+		return BuildPrompt(task, provider)
+	}
+	transportCfg := transportretry.ResolveConfig(transportretry.ResolveOptions{
+		WorkspaceSettings: d.workspaceSettings(task.WorkspaceID),
+		RuntimeMetadata:   d.runtimeMetadata(task.RuntimeID),
+		AgentCustomEnv:    agentCustomEnv,
+	})
+	result, tools, transportStats, transportRetired, transportReceiptJSON, err := d.executeWithTransportRetry(
+		ctx, transportCfg, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq,
+		provider, task.PriorSessionID, onTransportFreshSession,
+	)
 	if err != nil {
 		return TaskResult{}, err
 	}
+	if len(transportReceiptJSON) > 0 {
+		taskLog.Info("transport_retry finished",
+			"policy", transportStats.PolicyID,
+			"attempts", transportStats.Attempts,
+			"recovered_on_attempt", transportStats.RecoveredOnAttempt,
+			"surfaced_to_server", transportStats.SurfacedToServer,
+		)
+	}
+	// Terminal paths below return fresh TaskResult literals; mirror the
+	// RetiredSessionID defer so optional transport-retry receipt survives.
+	defer func() { taskResult.TransportRetryReceipt = transportReceiptJSON }()
 
 	// retiredSessionID is the session this run was told to resume and then
 	// abandoned. Captured before the retry clears task.PriorSessionID, and
@@ -7082,6 +7151,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// row but still reachable through an older completed row on the issue or
 	// through the chat_session pointer (GH #6066).
 	var retiredSessionID string
+	if transportRetired != "" {
+		retiredSessionID = transportRetired
+	}
 	defer func() { taskResult.RetiredSessionID = retiredSessionID }()
 
 	if shouldRetryWithFreshSession(result, task.PriorSessionID, tools, provider) {
@@ -7360,7 +7432,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// taxonomy at write time instead of waiting on the
 			// MUL-1949 offline backfill to re-classify after the
 			// fact.
-			failureReason = taskfailure.Classify(errMsg).String()
+			failureReason = classifyAgentFailureReason(errMsg, transportStats)
 		}
 		// After the classifiers above have read errMsg. The hint is fixed
 		// prose chosen to match none of the resume guards (see its const), so
