@@ -4473,6 +4473,16 @@ func ResumeUnsafeFailure(failureReason, errorText string) bool {
 	return taskfailure.UnresumableHistory(errorText)
 }
 
+// AutoRetryEligible reports whether a failed task with an issue link would be
+// auto-retried for the given failure reason and attempt budget.
+func AutoRetryEligible(failureReason string, attempt, maxAttempts int32) bool {
+	return retryEligible(failureReason, db.AgentTaskQueue{
+		Attempt:     attempt,
+		MaxAttempts: maxAttempts,
+		IssueID:     pgtype.UUID{Bytes: [16]byte{1}, Valid: true},
+	})
+}
+
 // retryEligible reports whether a failed task qualifies for an automatic retry
 // attempt: an infrastructure-shaped failure_reason, remaining attempt budget,
 // not an autopilot run, and linked to an issue or chat session. Shared by

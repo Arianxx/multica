@@ -2289,6 +2289,7 @@ func TestExecuteWithTransportRetry_RecoversWritableIterable(t *testing.T) {
 				ID:               "cursor_writable_iterable",
 				Providers:        []string{"cursor"},
 				MatchError:       transportretry.DefaultPolicies()[0].MatchError,
+				MaxExtraAttempts: 3,
 				DelaysMs:         []int{0, 0, 0},
 				SessionStrategy: []transportretry.SessionRetryMode{
 					transportretry.SessionRetrySame,

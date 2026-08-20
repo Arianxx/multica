@@ -34,6 +34,29 @@ func cacheReadTotal(usage map[string]TokenUsageView) int64 {
 	return total
 }
 
+func mergeUsageViews(a, b map[string]TokenUsageView) map[string]TokenUsageView {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	merged := make(map[string]TokenUsageView, len(a)+len(b))
+	for model, u := range a {
+		merged[model] = u
+	}
+	for model, u := range b {
+		existing := merged[model]
+		existing.InputTokens += u.InputTokens
+		existing.OutputTokens += u.OutputTokens
+		existing.CacheReadTokens += u.CacheReadTokens
+		existing.CacheWriteTokens += u.CacheWriteTokens
+		existing.CostUSDTicks += u.CostUSDTicks
+		merged[model] = existing
+	}
+	return merged
+}
+
 // ExecuteWithRetry runs execute up to the policy launch budget, retrying matching transport failures.
 func ExecuteWithRetry(
 	ctx context.Context,
@@ -47,12 +70,21 @@ func ExecuteWithRetry(
 	initialPrompt string,
 	initialOpts ExecOptionsView,
 ) (ResultView, int32, Stats, string, error) {
+	for i := range cfg.Policies {
+		normalizeRetryPolicy(&cfg.Policies[i])
+	}
 	if !cfg.Enabled {
 		if observer != nil {
 			observer.RecordAttempt(provider, "", "", "skipped_disabled")
 		}
 		result, tools, err := execute(initialPrompt, initialOpts)
 		return result, tools, Stats{}, "", err
+	}
+
+	if cfg.MaxRetryWallClockS > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, time.Now().Add(time.Duration(cfg.MaxRetryWallClockS)*time.Second))
+		defer cancel()
 	}
 
 	prompt := initialPrompt
@@ -64,11 +96,14 @@ func ExecuteWithRetry(
 		launchIndex    int
 		lastPolicy     Policy
 		matchedPolicy  bool
+		mergedUsage    map[string]TokenUsageView
 	)
 
 	for {
 		result, tools, err := execute(prompt, opts)
 		stats.Attempts = launchIndex + 1
+		mergedUsage = mergeUsageViews(mergedUsage, result.Usage)
+		result.Usage = mergedUsage
 		if launchIndex == 0 {
 			stats.CacheReadTokensFirst = cacheReadTotal(result.Usage)
 		}
@@ -109,6 +144,7 @@ func ExecuteWithRetry(
 					observer.RecordAttempt(provider, policy.ID, "", "skipped_tools")
 				}
 			}
+			stats.SkippedDueToTools = stats.PolicyID != ""
 			stats.SurfacedToServer = true
 			stats.ExtraWallSeconds = time.Since(extraWallStart).Seconds()
 			if observer != nil {
@@ -205,29 +241,31 @@ func ExecuteWithRetry(
 }
 
 func waitForRetry(ctx context.Context, extraWallStart time.Time, maxWallS, delayMs int) error {
+	if maxWallS > 0 && time.Since(extraWallStart) >= time.Duration(maxWallS)*time.Second {
+		return context.DeadlineExceeded
+	}
 	if delayMs <= 0 {
-		if maxWallS > 0 && time.Since(extraWallStart).Seconds() >= float64(maxWallS) {
-			return ctx.Err()
-		}
 		return nil
 	}
-	timer := time.NewTimer(time.Duration(delayMs) * time.Millisecond)
-	defer timer.Stop()
+	delay := time.Duration(delayMs) * time.Millisecond
 	if maxWallS > 0 {
 		deadline := extraWallStart.Add(time.Duration(maxWallS) * time.Second)
-		if time.Until(deadline) <= 0 {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return context.DeadlineExceeded
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return nil
+		if delay > remaining {
+			delay = remaining
 		}
 	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return context.DeadlineExceeded
 	case <-timer.C:
 		return nil
 	}

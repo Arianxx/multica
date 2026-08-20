@@ -18,6 +18,7 @@ type Stats struct {
 	CacheReadTokensFirst     int64              `json:"cache_read_tokens_first,omitempty"`
 	CacheReadTokensRecovered int64              `json:"cache_read_tokens_recovered,omitempty"`
 	SurfacedToServer         bool               `json:"surfaced_to_server,omitempty"`
+	SkippedDueToTools        bool               `json:"skipped_due_to_tools,omitempty"`
 	ExtraWallSeconds         float64            `json:"extra_wall_seconds,omitempty"`
 }
 
@@ -31,16 +32,22 @@ type ExecOptionsView struct {
 
 // ResultView is the slice of agent.Result the retry executor reads.
 type ResultView struct {
-	Status    string
-	Output    string
-	Error     string
-	SessionID string
-	Usage     map[string]TokenUsageView
+	Status         string
+	Output         string
+	Error          string
+	DurationMs     int64
+	SessionID      string
+	Usage          map[string]TokenUsageView
+	ResumeRejected bool
 }
 
-// TokenUsageView carries token fields used for cache-read verification.
+// TokenUsageView carries billing fields the retry executor must preserve.
 type TokenUsageView struct {
-	CacheReadTokens int64
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	CostUSDTicks     int64
 }
 
 // RetryHooks supplies daemon-specific fresh-session recovery.

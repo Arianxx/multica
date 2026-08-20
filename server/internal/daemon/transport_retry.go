@@ -8,6 +8,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/daemon/transportretry"
 	"github.com/multica-ai/multica/server/pkg/agent"
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 // transportRetryReceipt is optional task-run metadata when in-turn transport retry occurred.
@@ -79,28 +80,52 @@ func (d *Daemon) executeWithTransportRetry(
 func agentResultView(r agent.Result) transportretry.ResultView {
 	usage := make(map[string]transportretry.TokenUsageView, len(r.Usage))
 	for model, u := range r.Usage {
-		usage[model] = transportretry.TokenUsageView{CacheReadTokens: u.CacheReadTokens}
+		usage[model] = tokenUsageView(u)
 	}
 	return transportretry.ResultView{
-		Status:    r.Status,
-		Output:    r.Output,
-		Error:     r.Error,
-		SessionID: r.SessionID,
-		Usage:     usage,
+		Status:         r.Status,
+		Output:         r.Output,
+		Error:          r.Error,
+		DurationMs:     r.DurationMs,
+		SessionID:      r.SessionID,
+		Usage:          usage,
+		ResumeRejected: r.ResumeRejected,
 	}
 }
 
 func agentResultFromView(v transportretry.ResultView) agent.Result {
 	usage := make(map[string]agent.TokenUsage, len(v.Usage))
 	for model, u := range v.Usage {
-		usage[model] = agent.TokenUsage{CacheReadTokens: u.CacheReadTokens}
+		usage[model] = agentTokenUsage(u)
 	}
 	return agent.Result{
-		Status:    v.Status,
-		Output:    v.Output,
-		Error:     v.Error,
-		SessionID: v.SessionID,
-		Usage:     usage,
+		Status:         v.Status,
+		Output:         v.Output,
+		Error:          v.Error,
+		DurationMs:     v.DurationMs,
+		SessionID:      v.SessionID,
+		Usage:          usage,
+		ResumeRejected: v.ResumeRejected,
+	}
+}
+
+func tokenUsageView(u agent.TokenUsage) transportretry.TokenUsageView {
+	return transportretry.TokenUsageView{
+		InputTokens:      u.InputTokens,
+		OutputTokens:     u.OutputTokens,
+		CacheReadTokens:  u.CacheReadTokens,
+		CacheWriteTokens: u.CacheWriteTokens,
+		CostUSDTicks:     u.CostUSDTicks,
+	}
+}
+
+func agentTokenUsage(u transportretry.TokenUsageView) agent.TokenUsage {
+	return agent.TokenUsage{
+		InputTokens:      u.InputTokens,
+		OutputTokens:     u.OutputTokens,
+		CacheReadTokens:  u.CacheReadTokens,
+		CacheWriteTokens: u.CacheWriteTokens,
+		CostUSDTicks:     u.CostUSDTicks,
 	}
 }
 
@@ -126,4 +151,15 @@ func marshalTransportRetryReceipt(stats transportretry.Stats) json.RawMessage {
 		return nil
 	}
 	return b
+}
+
+// classifyAgentFailureReason maps a terminal agent error to the failure_reason
+// column. Transport failures that matched a retry policy but were skipped
+// because tools already ran must not classify as provider_network — the
+// server auto-retry path has no tool gate and would duplicate side effects.
+func classifyAgentFailureReason(errMsg string, stats transportretry.Stats) string {
+	if stats.SkippedDueToTools {
+		return taskfailure.ReasonAgentUnknown.String()
+	}
+	return taskfailure.Classify(errMsg).String()
 }

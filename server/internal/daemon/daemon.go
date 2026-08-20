@@ -7432,7 +7432,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			// taxonomy at write time instead of waiting on the
 			// MUL-1949 offline backfill to re-classify after the
 			// fact.
-			failureReason = taskfailure.Classify(errMsg).String()
+			failureReason = classifyAgentFailureReason(errMsg, transportStats)
 		}
 		// After the classifiers above have read errMsg. The hint is fixed
 		// prose chosen to match none of the resume guards (see its const), so

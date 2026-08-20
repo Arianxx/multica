@@ -14,6 +14,9 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
 	"github.com/multica-ai/multica/server/internal/daemon/transportretry"
+	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/pkg/agent"
+	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
 
 func TestMarshalTransportRetryReceipt_TopLevelFields(t *testing.T) {
@@ -137,5 +140,69 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"o
 	}
 	if attempts, _ := receipt["attempts"].(float64); attempts < 2 {
 		t.Fatalf("attempts = %v, want >= 2 after in-turn recovery", receipt["attempts"])
+	}
+}
+
+func TestAgentResultViewRoundTripPreservesBillingFields(t *testing.T) {
+	t.Parallel()
+
+	original := agent.Result{
+		Status:         "failed",
+		Output:         "out",
+		Error:          "WritableIterable is closed",
+		DurationMs:     1200,
+		SessionID:      "sess-1",
+		ResumeRejected: true,
+		Usage: map[string]agent.TokenUsage{
+			"m": {
+				InputTokens:      10,
+				OutputTokens:     5,
+				CacheReadTokens:  3,
+				CacheWriteTokens: 2,
+				CostUSDTicks:     900,
+			},
+		},
+	}
+
+	view := agentResultView(original)
+	roundTrip := agentResultFromView(view)
+	if roundTrip.Status != original.Status || roundTrip.Output != original.Output ||
+		roundTrip.Error != original.Error || roundTrip.DurationMs != original.DurationMs ||
+		roundTrip.SessionID != original.SessionID || roundTrip.ResumeRejected != original.ResumeRejected {
+		t.Fatalf("round trip metadata = %+v, want %+v", roundTrip, original)
+	}
+	if len(roundTrip.Usage) != len(original.Usage) {
+		t.Fatalf("usage len = %d, want %d", len(roundTrip.Usage), len(original.Usage))
+	}
+	for model, want := range original.Usage {
+		got := roundTrip.Usage[model]
+		if got != want {
+			t.Fatalf("usage[%s] = %+v, want %+v", model, got, want)
+		}
+	}
+}
+
+func TestClassifyAgentFailureReasonAfterToolsSkipsProviderNetworkAutoRetry(t *testing.T) {
+	t.Parallel()
+
+	errMsg := "RetriableError: WritableIterable is closed (result_seen=false)"
+	stats := transportretry.Stats{
+		PolicyID:         "cursor_writable_iterable",
+		SkippedDueToTools: true,
+	}
+	reason := classifyAgentFailureReason(errMsg, stats)
+	if reason != taskfailure.ReasonAgentUnknown.String() {
+		t.Fatalf("reason = %q, want %q", reason, taskfailure.ReasonAgentUnknown)
+	}
+	if service.AutoRetryEligible(reason, 1, 2) {
+		t.Fatal("transport failure after tool use must not be server auto-retry eligible")
+	}
+
+	networkReason := classifyAgentFailureReason(errMsg, transportretry.Stats{})
+	if networkReason != taskfailure.ReasonAgentProviderNetwork.String() {
+		t.Fatalf("plain classify = %q, want provider_network", networkReason)
+	}
+	if !service.AutoRetryEligible(networkReason, 1, 2) {
+		t.Fatal("provider_network without tools should stay auto-retry eligible")
 	}
 }

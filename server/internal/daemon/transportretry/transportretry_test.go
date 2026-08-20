@@ -325,20 +325,23 @@ func TestExecuteWithRetryExhaustedAfterFreshSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecuteWithRetry: %v", err)
 	}
-	if calls.Load() != 4 {
-		t.Fatalf("calls = %d, want 4 launches before exhaustion", calls.Load())
+	if calls.Load() != 3 {
+		t.Fatalf("calls = %d, want 3 launches before exhaustion", calls.Load())
 	}
 	if !stats.SurfacedToServer {
-		t.Fatal("expected surfaced_to_server=true after exhausting fresh_session")
+		t.Fatal("expected surfaced_to_server=true after exhausting retries")
 	}
-	if stats.Attempts != 4 {
-		t.Fatalf("attempts = %d, want 4", stats.Attempts)
+	if stats.Attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", stats.Attempts)
 	}
 	if !recorder.exhausted {
 		t.Fatal("expected exhausted outcome metric")
 	}
-	modes := []string{stats.SessionModes[0].String(), stats.SessionModes[1].String(), stats.SessionModes[2].String()}
-	wantModes := []string{"same_session", "same_session", "fresh_session"}
+	if len(stats.SessionModes) != 2 {
+		t.Fatalf("session_modes len = %d, want 2", len(stats.SessionModes))
+	}
+	modes := []string{stats.SessionModes[0].String(), stats.SessionModes[1].String()}
+	wantModes := []string{"same_session", "same_session"}
 	for i := range wantModes {
 		if modes[i] != wantModes[i] {
 			t.Fatalf("session_modes[%d] = %q, want %q", i, modes[i], wantModes[i])
@@ -411,4 +414,162 @@ func TestMetricsRecordRecovered(t *testing.T) {
 	m := transportretry.GlobalMetrics()
 	m.RecordRecovered("cursor", "cursor_writable_iterable", "same_session")
 	m.RecordAttempt("cursor", "cursor_writable_iterable", "same_session", "recovered")
+}
+
+func TestExecuteWithRetryMergesUsageAcrossAttempts(t *testing.T) {
+	t.Parallel()
+
+	cfg := transportretry.DefaultConfig()
+	cfg.Policies = []transportretry.Policy{
+		{
+			ID:               "cursor_writable_iterable",
+			Providers:        []string{"cursor"},
+			MatchError:       transportretry.DefaultPolicies()[0].MatchError,
+			MaxExtraAttempts: 1,
+			DelaysMs:         []int{0, 0},
+			SessionStrategy: []transportretry.SessionRetryMode{
+				transportretry.SessionRetrySame,
+				transportretry.SessionRetrySame,
+			},
+			Enabled: true,
+		},
+	}
+
+	failErr := "WritableIterable is closed (result_seen=false)"
+	var calls atomic.Int32
+	execute := func(_ string, _ transportretry.ExecOptionsView) (transportretry.ResultView, int32, error) {
+		i := calls.Add(1)
+		if i == 1 {
+			return transportretry.ResultView{
+				Status: "failed",
+				Error:  failErr,
+				Usage: map[string]transportretry.TokenUsageView{
+					"m": {InputTokens: 10, OutputTokens: 5, CostUSDTicks: 100},
+				},
+			}, 0, nil
+		}
+		return transportretry.ResultView{
+			Status: "completed",
+			Usage: map[string]transportretry.TokenUsageView{
+				"m": {InputTokens: 3, OutputTokens: 2, CostUSDTicks: 50},
+			},
+		}, 0, nil
+	}
+
+	result, _, _, _, err := transportretry.ExecuteWithRetry(
+		context.Background(),
+		cfg,
+		"cursor",
+		"",
+		transportretry.RetryHooks{},
+		nil,
+		slog.Default(),
+		execute,
+		"prompt",
+		transportretry.ExecOptionsView{},
+	)
+	if err != nil {
+		t.Fatalf("ExecuteWithRetry: %v", err)
+	}
+	usage := result.Usage["m"]
+	if usage.InputTokens != 13 || usage.OutputTokens != 7 || usage.CostUSDTicks != 150 {
+		t.Fatalf("merged usage = %+v, want input=13 output=7 cost=150", usage)
+	}
+}
+
+func TestMaxExtraAttemptsCapsSessionStrategy(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"policies":[{"id":"cursor_writable_iterable","max_extra_attempts":1}]}`
+	cfg := transportretry.MergeConfigJSON(transportretry.DefaultConfig(), raw)
+	policy := cfg.Policies[0]
+	if len(policy.SessionStrategy) != 1 {
+		t.Fatalf("session_strategy len = %d, want 1", len(policy.SessionStrategy))
+	}
+	if transportretry.TotalLaunches(policy) != 2 {
+		t.Fatalf("total launches = %d, want 2", transportretry.TotalLaunches(policy))
+	}
+}
+
+func TestExecuteWithRetryStopsAtWallClockBudget(t *testing.T) {
+	t.Parallel()
+
+	cfg := transportretry.Config{
+		Enabled:            true,
+		MaxRetryWallClockS: 1,
+		Policies: []transportretry.Policy{
+			{
+				ID:               "stub_transport",
+				Providers:        []string{"stub"},
+				MatchError:       func(err string) bool { return strings.Contains(err, "stub-transport-fail") },
+				MaxExtraAttempts: 5,
+				DelaysMs:         []int{500, 500, 500, 500, 500, 500},
+				SessionStrategy: []transportretry.SessionRetryMode{
+					transportretry.SessionRetryCold,
+					transportretry.SessionRetryCold,
+					transportretry.SessionRetryCold,
+					transportretry.SessionRetryCold,
+					transportretry.SessionRetryCold,
+				},
+				Enabled: true,
+			},
+		},
+	}
+
+	var calls atomic.Int32
+	execute := func(_ string, _ transportretry.ExecOptionsView) (transportretry.ResultView, int32, error) {
+		calls.Add(1)
+		return transportretry.ResultView{Status: "failed", Error: "stub-transport-fail"}, 0, nil
+	}
+
+	_, _, stats, _, err := transportretry.ExecuteWithRetry(
+		context.Background(),
+		cfg,
+		"stub",
+		"",
+		transportretry.RetryHooks{},
+		nil,
+		slog.Default(),
+		execute,
+		"prompt",
+		transportretry.ExecOptionsView{},
+	)
+	if err == nil {
+		t.Fatal("expected wall-clock budget error")
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("calls = %d, want at least 2 before budget exhaustion", calls.Load())
+	}
+	if !stats.SurfacedToServer {
+		t.Fatal("expected surfaced_to_server when wall clock exhausted")
+	}
+}
+
+func TestExecuteWithRetrySkippedDueToTools(t *testing.T) {
+	t.Parallel()
+
+	cfg := transportretry.DefaultConfig()
+	failErr := "WritableIterable is closed (result_seen=false)"
+	execute := func(_ string, _ transportretry.ExecOptionsView) (transportretry.ResultView, int32, error) {
+		return transportretry.ResultView{Status: "failed", Error: failErr}, 1, nil
+	}
+
+	_, _, stats, _, err := transportretry.ExecuteWithRetry(
+		context.Background(),
+		cfg,
+		"cursor",
+		"",
+		transportretry.RetryHooks{},
+		nil,
+		slog.Default(),
+		execute,
+		"prompt",
+		transportretry.ExecOptionsView{},
+	)
+	if err != nil {
+		t.Fatalf("ExecuteWithRetry: %v", err)
+	}
+	if !stats.SkippedDueToTools {
+		t.Fatal("expected skipped_due_to_tools when transport error matches after tool use")
+	}
 }

@@ -70,8 +70,8 @@ func DefaultPolicies() []Policy {
 			ID:               "cursor_writable_iterable",
 			Providers:        []string{"cursor"},
 			MatchError:       matchCursorWritableIterable,
-			MaxExtraAttempts: 2,
-			DelaysMs: []int{0, 0, 5000},
+			MaxExtraAttempts: 3,
+			DelaysMs:         []int{0, 0, 5000},
 			SessionStrategy: []SessionRetryMode{
 				SessionRetrySame,
 				SessionRetrySame,
@@ -96,10 +96,14 @@ func DefaultPolicies() []Policy {
 
 // DefaultConfig returns enabled defaults.
 func DefaultConfig() Config {
-	return Config{
+	cfg := Config{
 		Enabled:  true,
 		Policies: DefaultPolicies(),
 	}
+	for i := range cfg.Policies {
+		normalizeRetryPolicy(&cfg.Policies[i])
+	}
+	return cfg
 }
 
 // LoadConfig merges built-in defaults with optional JSON from MULTICA_TRANSPORT_RETRY_CONFIG.
@@ -130,6 +134,9 @@ func MergeConfigJSON(cfg Config, raw string) Config {
 	}
 	if len(file.Policies) > 0 {
 		applyPolicyOverrides(&cfg, file.Policies)
+	}
+	for i := range cfg.Policies {
+		normalizeRetryPolicy(&cfg.Policies[i])
 	}
 	return cfg
 }
@@ -200,7 +207,39 @@ func applyPolicyOverrides(cfg *Config, overrides []PolicyOverride) {
 		if len(o.SessionStrategy) > 0 {
 			p.SessionStrategy = append([]SessionRetryMode(nil), o.SessionStrategy...)
 		}
+		normalizeRetryPolicy(p)
 	}
+	for i := range cfg.Policies {
+		normalizeRetryPolicy(&cfg.Policies[i])
+	}
+}
+
+// normalizeRetryPolicy enforces a single authoritative extra-attempt budget. When
+// SessionStrategy is present, MaxExtraAttempts caps how many of those modes
+// may run; overrides to max_extra_attempts therefore bound default ladders.
+func normalizeRetryPolicy(p *Policy) {
+	if p.MaxExtraAttempts < 0 {
+		p.MaxExtraAttempts = 0
+	}
+	if len(p.SessionStrategy) > p.MaxExtraAttempts {
+		p.SessionStrategy = append([]SessionRetryMode(nil), p.SessionStrategy[:p.MaxExtraAttempts]...)
+	}
+	if len(p.DelaysMs) > p.MaxExtraAttempts+1 {
+		p.DelaysMs = append([]int(nil), p.DelaysMs[:p.MaxExtraAttempts+1]...)
+	}
+}
+
+// extraAttempts is the number of launches after the first failure-driven retry.
+func extraAttempts(policy Policy) int {
+	if len(policy.SessionStrategy) > 0 {
+		return len(policy.SessionStrategy)
+	}
+	return policy.MaxExtraAttempts
+}
+
+// totalLaunches is the maximum backend launches for a policy.
+func totalLaunches(policy Policy) int {
+	return 1 + extraAttempts(policy)
 }
 
 func policyMatchesProvider(policy Policy, provider string) bool {
@@ -227,15 +266,10 @@ func findPolicy(cfg Config, provider string, errText string) (Policy, bool) {
 	return Policy{}, false
 }
 
-// totalLaunches is the maximum backend launches for a policy. SessionStrategy
-// entries describe the session mode for each retry after a failure; the
-// initial launch is not listed, so budget is 1 + len(SessionStrategy).
-func totalLaunches(policy Policy) int {
-	n := len(policy.SessionStrategy)
-	if n == 0 {
-		return 1 + policy.MaxExtraAttempts
-	}
-	return 1 + n
+// TotalLaunches reports how many backend launches a policy may perform.
+func TotalLaunches(policy Policy) int {
+	normalizeRetryPolicy(&policy)
+	return totalLaunches(policy)
 }
 
 func delayForLaunch(policy Policy, launchIndex int) int {
