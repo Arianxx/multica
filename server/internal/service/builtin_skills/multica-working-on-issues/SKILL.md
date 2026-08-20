@@ -86,6 +86,19 @@ In the final issue comment, include the PR URL when a PR exists. If the task did
 not produce a PR because no code changed or the user asked not to create one, say
 that explicitly.
 
+### Multica platform fork (PR target)
+
+Fork checkouts of `https://github.com/Arianxx/multica` must pass `--repo` on
+`gh pr create` — without it, GitHub defaults the PR base to upstream
+`multica-ai/multica` (two workspace PRs landed upstream by mistake, WOR-550).
+
+```bash
+gh pr create --repo Arianxx/multica --base <target-branch> ...
+```
+
+Never target `multica-ai/multica` unless the issue explicitly authorizes upstream
+contribution.
+
 ## Reading a linked PR's real state
 
 When a step depends on PR state, query Multica's link table — do not infer it

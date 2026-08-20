@@ -232,6 +232,9 @@ func TestWorkingOnIssuesSkillCoversIssueLoopContracts(t *testing.T) {
 		"This is a default, not",
 		"Use a routable issue key in the PR title, body, or branch",
 		"include the PR URL when a PR exists",
+		"Multica platform fork (PR target)",
+		"gh pr create --repo Arianxx/multica --base <target-branch>",
+		"Never target `multica-ai/multica` unless the issue explicitly authorizes upstream",
 		"Closes MUL-2759",
 		"--status backlog",
 		// The only sanctioned pr_url reference is the negative compatibility
